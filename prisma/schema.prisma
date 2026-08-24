@@ -1,0 +1,521 @@
+// ============================================================================
+// Healthcare Appointment & Follow-up Manager — Prisma Schema
+// ============================================================================
+// Database: PostgreSQL (Neon free tier)
+// ORM: Prisma 5.x
+//
+// Key design decisions:
+//   1. Partial unique index on Appointment(doctorId, slotStartTime) WHERE
+//      status != 'CANCELLED' — prevents double-booking at the DB level.
+//   2. Slot hold mechanism via HELD status + heldUntil timestamp.
+//   3. Availability is weekly-recurring; Slots are concrete per-date entries.
+//   4. MedicationReminder linked to both Prescription and PatientProfile for
+//      fast lookup without joining through Appointment.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────
+
+enum UserRole {
+  PATIENT
+  DOCTOR
+  ADMIN
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum AppointmentStatus {
+  HELD
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
+  EXPIRED
+}
+
+enum AppointmentType {
+  IN_PERSON
+  FOLLOW_UP
+  TELECONSULT
+}
+
+enum CancelledBy {
+  PATIENT
+  DOCTOR
+  ADMIN
+  SYSTEM
+}
+
+enum UrgencyLevel {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum SummaryStatus {
+  COMPLETED
+  PENDING_REVIEW
+  FAILED
+}
+
+enum JobStatus {
+  PENDING
+  PROCESSING
+  FAILED
+  COMPLETED
+}
+
+enum JobType {
+  EMAIL
+  LLM_RETRY
+  CALENDAR_SYNC
+}
+
+enum Severity {
+  MILD
+  MODERATE
+  SEVERE
+}
+
+enum NotificationType {
+  APPOINTMENT_BOOKED
+  APPOINTMENT_CANCELLED
+  APPOINTMENT_REMINDER
+  PRESCRIPTION_READY
+  MEDICATION_REMINDER
+  GENERAL
+}
+
+enum ReminderFrequency {
+  ONCE_DAILY
+  TWICE_DAILY
+  THRICE_DAILY
+  FOUR_TIMES_DAILY
+  CUSTOM
+}
+
+// ─────────────────────────────────────────────
+// 1. USER — Base identity for all roles
+// ─────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  phone        String?
+  role         UserRole @default(PATIENT)
+  avatar       String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Relations
+  doctorProfile  DoctorProfile?
+  patientProfile PatientProfile?
+  notifications  Notification[]
+  refreshTokens  RefreshToken[]
+  googleIntegration GoogleIntegration?
+
+  // Indexes
+  @@index([role])
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────
+// 1c. GOOGLE INTEGRATION — OAuth 2.0 Tokens
+// ─────────────────────────────────────────────
+
+model GoogleIntegration {
+  id           String   @id @default(cuid())
+  userId       String   @unique
+  accessToken  String
+  refreshToken String
+  expiryDate   DateTime
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("google_integrations")
+}
+
+// ─────────────────────────────────────────────
+// 1b. REFRESH TOKEN — For JWT refresh token rotation
+// ─────────────────────────────────────────────
+
+model RefreshToken {
+  id              String    @id @default(cuid())
+  token           String    @unique
+  userId          String
+  expiresAt       DateTime
+  createdAt       DateTime  @default(now())
+  revokedAt       DateTime?
+  replacedByToken String?   // Points to the new token in rotation chain
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Fast lookup by token, cleanup by user
+  @@index([userId])
+  @@index([token])
+  @@map("refresh_tokens")
+}
+
+// ─────────────────────────────────────────────
+// 2. DOCTOR PROFILE — Extended doctor info
+// ─────────────────────────────────────────────
+
+model DoctorProfile {
+  id                String   @id @default(cuid())
+  userId            String   @unique
+  specialization    String
+  qualification     String
+  experience        Int      @default(0)
+  consultationFee   Float    @default(0)
+  slotDuration      Int      @default(30) // minutes
+  bio               String?
+  maxPatientsPerDay Int?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  user         User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  availability Availability[]
+  leaveDays    LeaveDay[]
+  slots        Slot[]
+  appointments Appointment[]
+
+  @@map("doctor_profiles")
+}
+
+// ─────────────────────────────────────────────
+// 3. PATIENT PROFILE — Extended patient info
+// ─────────────────────────────────────────────
+
+model PatientProfile {
+  id               String    @id @default(cuid())
+  userId           String    @unique
+  dateOfBirth      DateTime?
+  gender           Gender?
+  bloodGroup       String?
+  allergies        String?
+  address          String?
+  emergencyContact String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  // Relations
+  user                User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  appointments        Appointment[]
+  medicationReminders MedicationReminder[]
+
+  @@map("patient_profiles")
+}
+
+// ─────────────────────────────────────────────
+// 4. AVAILABILITY — Weekly recurring schedule
+// ─────────────────────────────────────────────
+// A doctor can have multiple windows per day
+// (e.g., 09:00–13:00 morning, 15:00–18:00 afternoon)
+
+model Availability {
+  id        String  @id @default(cuid())
+  doctorId  String
+  dayOfWeek Int // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+  startTime String // "HH:mm" format, e.g. "09:00"
+  endTime   String // "HH:mm" format, e.g. "13:00"
+  isActive  Boolean @default(true)
+
+  // Relations
+  doctor DoctorProfile @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  // Prevent duplicate schedule entries for the same time window
+  @@unique([doctorId, dayOfWeek, startTime], name: "availability_doctor_day_time")
+  @@index([doctorId, dayOfWeek])
+  @@map("availability")
+}
+
+// ─────────────────────────────────────────────
+// 5. SLOT — Concrete time slots for a specific date
+// ─────────────────────────────────────────────
+// Generated from Availability rules. Each row represents
+// one bookable time slot on a specific calendar date.
+
+model Slot {
+  id          String   @id @default(cuid())
+  doctorId    String
+  date        DateTime // Calendar date (time portion ignored)
+  startTime   String // "HH:mm"
+  endTime     String // "HH:mm"
+  isAvailable Boolean  @default(true) // Can be manually blocked
+
+  // Relations
+  doctor       DoctorProfile @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  appointments Appointment[]
+
+  // Prevent duplicate slot generation
+  @@unique([doctorId, date, startTime], name: "slot_doctor_date_time")
+  // Fast available-slot lookups: GET /api/doctors/:id/slots?date=...
+  @@index([doctorId, date, isAvailable])
+  @@map("slots")
+}
+
+// ─────────────────────────────────────────────
+// 6. APPOINTMENT — Core booking entity
+// ─────────────────────────────────────────────
+// The slotStartTime is a full DateTime (date + time) to support
+// the partial unique index for double-booking prevention.
+//
+// IMPORTANT: A raw SQL partial unique index is added in the
+// migration to enforce:
+//   UNIQUE(doctorId, slotStartTime) WHERE status != 'CANCELLED'
+
+model Appointment {
+  id            String            @id @default(cuid())
+  patientId     String
+  doctorId      String
+  slotId        String? // Optional reference to generated Slot
+  slotStartTime DateTime // Full timestamp: 2025-01-15T09:00:00Z
+  slotEndTime   DateTime // Full timestamp: 2025-01-15T09:30:00Z
+  status        AppointmentStatus @default(HELD)
+  heldUntil     DateTime? // Expiry time for HELD status (e.g. now + 5min)
+  type          AppointmentType   @default(IN_PERSON)
+  reason        String? // Brief visit reason from patient
+  cancelledBy   CancelledBy? // Who initiated cancellation
+  cancelReason  String?
+  doctorGoogleEventId  String? // Nullable independent ID
+  patientGoogleEventId String? // Nullable independent ID
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  // Relations
+  patient      PatientProfile @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  doctor       DoctorProfile  @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  slot         Slot?          @relation(fields: [slotId], references: [id], onDelete: SetNull)
+  symptoms     Symptom[]
+  visitNote    VisitNote?
+  prescription Prescription?
+  preVisitSummary PreVisitSummary?
+  postVisitSummary PostVisitSummary?
+
+  // NOTE: The partial unique index for double-booking prevention is added
+  // via raw SQL in the migration file because Prisma does not support
+  // partial (filtered) unique indexes natively.
+  // See: migration.sql → CREATE UNIQUE INDEX "appointment_no_double_book" ...
+
+  // ── Indexes ──
+  // Doctor schedule lookups: "show me Dr. Smith's appointments on Jan 15"
+  @@index([doctorId, slotStartTime], name: "appointment_doctor_schedule")
+  // Patient history lookups: "show me all my past appointments"
+  @@index([patientId, createdAt], name: "appointment_patient_history")
+  // Expired hold cleanup: cron query for HELD appointments past their heldUntil
+  @@index([status, heldUntil], name: "appointment_hold_cleanup")
+  @@map("appointments")
+}
+
+// ─────────────────────────────────────────────
+// 7. SYMPTOM — Patient-reported symptoms
+// ─────────────────────────────────────────────
+
+model Symptom {
+  id            String   @id @default(cuid())
+  appointmentId String
+  name          String // e.g. "Headache", "Fever"
+  severity      Severity @default(MILD)
+  duration      String? // e.g. "3 days", "1 week"
+  notes         String? // Additional detail
+
+  // Relations
+  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+
+  @@index([appointmentId])
+  @@map("symptoms")
+}
+
+// ─────────────────────────────────────────────
+// 8. VISIT NOTE — Doctor's clinical notes
+// ─────────────────────────────────────────────
+// 1:1 with Appointment (one note per visit)
+
+model VisitNote {
+  id            String    @id @default(cuid())
+  appointmentId String    @unique // 1:1
+  diagnosis     String
+  examination   String? // Physical exam findings
+  notes         String? // Free-form doctor notes
+  followUpDate  DateTime? // Suggested return date
+  createdAt     DateTime  @default(now())
+
+  // Relations
+  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+
+  @@map("visit_notes")
+}
+
+// ─────────────────────────────────────────────
+// 9. PRESCRIPTION — Medications prescribed
+// ─────────────────────────────────────────────
+// 1:1 with Appointment. Medications stored as JSON array:
+// [{ name: "Amoxicillin", dosage: "500mg", frequency: "3x/day",
+//    duration: "7 days", instructions: "After meals" }]
+
+model Prescription {
+  id            String   @id @default(cuid())
+  appointmentId String   @unique // 1:1
+  medications   Json // Array of medication objects
+  advice        String? // General advice
+  createdAt     DateTime @default(now())
+
+  // Relations
+  appointment         Appointment          @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  medicationReminders MedicationReminder[]
+
+  @@map("prescriptions")
+}
+
+// ─────────────────────────────────────────────
+// 10. MEDICATION REMINDER
+// ─────────────────────────────────────────────
+// Reminders for patients to take prescribed medications.
+// Linked to both Prescription (source) and PatientProfile
+// (denormalized for fast per-patient queries).
+
+model MedicationReminder {
+  id             String            @id @default(cuid())
+  prescriptionId String
+  patientId      String
+  medicationName String // Which medication
+  dosage         String // e.g. "500mg"
+  frequency      ReminderFrequency
+  reminderTimes  Json // ["08:00", "14:00", "20:00"]
+  startDate      DateTime
+  endDate        DateTime
+  isActive       Boolean           @default(true)
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  // Relations
+  prescription Prescription   @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
+  patient      PatientProfile @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  // Active reminders per patient
+  @@index([patientId, isActive])
+  @@index([prescriptionId])
+  @@map("medication_reminders")
+}
+
+// ─────────────────────────────────────────────
+// 11. NOTIFICATION — In-app notifications
+// ─────────────────────────────────────────────
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  type      NotificationType
+  title     String
+  message   String
+  isRead    Boolean          @default(false)
+  link      String? // Deep link into the app
+  createdAt DateTime         @default(now())
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Unread notifications feed, most recent first
+  @@index([userId, isRead, createdAt])
+  @@map("notifications")
+}
+
+// ─────────────────────────────────────────────
+// 12. LEAVE DAY — Doctor leave/absence
+// ─────────────────────────────────────────────
+
+model LeaveDay {
+  id        String   @id @default(cuid())
+  doctorId  String
+  date      DateTime // The date of leave
+  reason    String?
+  isFullDay Boolean  @default(true)
+  startTime String? // If half-day: "09:00"
+  endTime   String? // If half-day: "13:00"
+
+  // Relations
+  doctor DoctorProfile @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  // One leave entry per doctor per date
+  @@unique([doctorId, date], name: "leave_doctor_date")
+  @@map("leave_days")
+}
+
+// ─────────────────────────────────────────────
+// 13. PRE-VISIT SUMMARY — LLM Analysis
+// ─────────────────────────────────────────────
+
+model PreVisitSummary {
+  id                 String        @id @default(cuid())
+  appointmentId      String        @unique
+  urgency            UrgencyLevel?
+  chiefComplaint     String?
+  suggestedQuestions String[]
+  rawOutput          String
+  status             SummaryStatus @default(COMPLETED)
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+
+  @@map("pre_visit_summaries")
+}
+
+// ─────────────────────────────────────────────
+// 14. POST-VISIT SUMMARY — LLM Analysis
+// ─────────────────────────────────────────────
+
+model PostVisitSummary {
+  id                 String        @id @default(cuid())
+  appointmentId      String        @unique
+  patientFriendlyText String?
+  rawOutput          String?
+  status             SummaryStatus @default(COMPLETED)
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  appointment Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+
+  @@map("post_visit_summaries")
+}
+
+// ─────────────────────────────────────────────
+// 15. BACKGROUND JOBS — Async tasks queue
+// ─────────────────────────────────────────────
+
+model BackgroundJob {
+  id          String    @id @default(cuid())
+  type        JobType
+  payload     Json
+  status      JobStatus @default(PENDING)
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(3)
+  nextRetryAt DateTime  @default(now())
+  errorLog    String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status, nextRetryAt], name: "idx_background_job_polling")
+  @@map("background_jobs")
+}

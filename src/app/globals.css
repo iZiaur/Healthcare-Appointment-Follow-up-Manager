@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --font-inter: 'Inter', sans-serif;
+  }
+  body {
+    @apply bg-brand-surface text-gray-900 font-sans antialiased;
+  }
+}
+
+/* Custom utilities for the premium aesthetic */
+@layer utilities {
+  .glass-card {
+    @apply bg-white/80 backdrop-blur-md border border-white/20 shadow-sm rounded-2xl;
+  }
+}
