@@ -1,6 +1,6 @@
 # Healthcare Appointment & Follow-up Manager
 
-A comprehensive clinic platform with distinct portals for Patients, Doctors, and Admins. Built with a modern Next.js 14 stack, Prisma ORM, and PostgreSQL.
+A comprehensive clinic platform with distinct portals for Patients, Doctors, and Admins. Built with a modern Next.js 14 stack, Prisma ORM, and PostgreSQL
 
 ## Architecture Highlights
 
